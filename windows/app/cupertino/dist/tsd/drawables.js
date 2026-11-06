@@ -1,0 +1,450 @@
+import { RawMessage, WireType } from "../base/protobuf.js";
+import { typeName } from "../tsp/registry.js";
+import { Drawable, Geometry } from "./schema.js";
+import { makeRef, Point, refId, SizeFields } from "../tsp/schema.js";
+import { DEFAULT_SHADOW, readFill, readShadow, readStroke, ShadowFields, writeFill, writeShadow, writeStroke, } from "./style.js";
+import { protoFields } from "../proto/fields.js";
+const SHADOW_SUBARCHIVE_FIELDS = [
+    ShadowFields.DROP_SHADOW,
+    ShadowFields.CONTACT_SHADOW,
+    ShadowFields.CURVED_SHADOW,
+];
+/**
+ * Locate the TSD.DrawableArchive submessage inside a concrete drawable by
+ * following `super` (field 1) chains until a message carrying a
+ * TSD.GeometryArchive (field 1 with position/size shape) is found.
+ */
+export function findDrawableCore(message, maxDepth = 6) {
+    // Field 1 is `super` in a drawable and something else entirely in the
+    // other archives that reach here — an attachment table lists footnote
+    // marks and smart fields beside drawables — so every read is wire-type
+    // guarded. A search returns `undefined` for "not one of these"; it does
+    // not throw.
+    const submessage = (m, field) => {
+        try {
+            return m.fieldWire(field) === WireType.Bytes ? m.getMessage(field) : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    };
+    let current = message;
+    for (let depth = 0; depth < maxDepth && current; depth++) {
+        const geometry = submessage(current, Drawable.GEOMETRY);
+        if (geometry && looksLikeGeometry(geometry))
+            return current;
+        current = submessage(current, 1);
+    }
+    return undefined;
+}
+function looksLikeGeometry(m) {
+    // A GeometryArchive holds a TSP.Point at 1 and TSP.Size at 2, both made of
+    // fixed32 floats. Checking wire types (not just presence) is what keeps
+    // unrelated messages with small field numbers from matching.
+    const isFloatPair = (child, a, b) => child !== undefined &&
+        child.fieldWire(a) === WireType.Fixed32 &&
+        child.fieldWire(b) === WireType.Fixed32;
+    let pos;
+    let size;
+    try {
+        pos = m.fieldWire(Geometry.POSITION) === WireType.Bytes ? m.getMessage(Geometry.POSITION) : undefined;
+        size = m.fieldWire(Geometry.SIZE) === WireType.Bytes ? m.getMessage(Geometry.SIZE) : undefined;
+    }
+    catch {
+        return false; // field 1/2 not parseable as messages
+    }
+    return isFloatPair(pos, Point.X, Point.Y) || isFloatPair(size, SizeFields.WIDTH, SizeFields.HEIGHT);
+}
+export class DrawableModel {
+    store;
+    object;
+    constructor(store, object) {
+        this.store = store;
+        this.object = object;
+    }
+    get id() {
+        return this.object.identifier;
+    }
+    get type() {
+        return this.object.type;
+    }
+    get typeName() {
+        return typeName(this.object.type, this.store.app);
+    }
+    core() {
+        return findDrawableCore(this.object.message);
+    }
+    geometry() {
+        const core = this.core();
+        const g = core?.getMessage(Drawable.GEOMETRY);
+        if (!g)
+            return undefined;
+        const pos = g.getMessage(Geometry.POSITION);
+        const size = g.getMessage(Geometry.SIZE);
+        return {
+            x: pos?.getFloat(Point.X),
+            y: pos?.getFloat(Point.Y),
+            width: size?.getFloat(SizeFields.WIDTH),
+            height: size?.getFloat(SizeFields.HEIGHT),
+            angle: g.getFloat(Geometry.ANGLE),
+            flags: g.getUint(Geometry.FLAGS),
+        };
+    }
+    /** Move and/or resize. Only the provided components are changed. */
+    setGeometry(update) {
+        const core = this.core();
+        if (!core)
+            throw new RangeError(`object ${this.id}: no drawable geometry found`);
+        let g = core.getMessage(Drawable.GEOMETRY);
+        if (!g) {
+            g = RawMessage.create();
+            core.setMessage(Drawable.GEOMETRY, g);
+        }
+        if (update.x !== undefined || update.y !== undefined) {
+            let pos = g.getMessage(Geometry.POSITION);
+            if (!pos) {
+                pos = RawMessage.create();
+                g.setMessage(Geometry.POSITION, pos);
+            }
+            if (update.x !== undefined)
+                pos.setFloat(Point.X, update.x);
+            if (update.y !== undefined)
+                pos.setFloat(Point.Y, update.y);
+        }
+        if (update.width !== undefined || update.height !== undefined) {
+            let size = g.getMessage(Geometry.SIZE);
+            if (!size) {
+                size = RawMessage.create();
+                g.setMessage(Geometry.SIZE, size);
+            }
+            if (update.width !== undefined)
+                size.setFloat(SizeFields.WIDTH, update.width);
+            if (update.height !== undefined)
+                size.setFloat(SizeFields.HEIGHT, update.height);
+        }
+        if (update.angle !== undefined)
+            g.setFloat(Geometry.ANGLE, update.angle);
+    }
+    get hyperlinkUrl() {
+        return this.core()?.getString(Drawable.HYPERLINK_URL);
+    }
+    get accessibilityDescription() {
+        return this.core()?.getString(Drawable.ACCESSIBILITY_DESCRIPTION);
+    }
+    set accessibilityDescription(value) {
+        const core = this.core();
+        if (!core)
+            throw new RangeError(`object ${this.id}: not a drawable`);
+        if (value === undefined)
+            core.remove(Drawable.ACCESSIBILITY_DESCRIPTION);
+        else
+            core.setString(Drawable.ACCESSIBILITY_DESCRIPTION, value);
+    }
+    /**
+     * Visual style — fill, stroke, opacity, shadow, reflection.
+     *
+     * This is where drawable **shadows** live. Cell and table styles have no
+     * shadow field at all, so a shadow on a table means a shadow on the
+     * shape or image, not on its cells.
+     */
+    style() {
+        const reference = this.styleReference();
+        return reference
+            ? new DrawableStyleHandle(this.store, reference.object, {
+                drawable: this.object,
+                field: reference.field,
+            })
+            : undefined;
+    }
+    /**
+     * Resolve the drawable's style object and the field referencing it.
+     *
+     * The field number differs per concrete archive (`ShapeArchive.style` is
+     * 2, `ImageArchive.style` is 3, and so on), so rather than tabulate every
+     * subclass we resolve each reference-shaped field and keep the one that
+     * lands on a shape or media style.
+     */
+    styleReference() {
+        for (const field of this.object.message.fields) {
+            if (field.wire !== WireType.Bytes)
+                continue;
+            const id = refId(this.object.message, field.no);
+            if (id === undefined)
+                continue;
+            const target = this.store.object(id);
+            if (target && isDrawableStyleType(target.type, this.store.app)) {
+                return { object: target, field: field.no };
+            }
+        }
+        return undefined;
+    }
+}
+/** Type ids of the TSD style archives, and the wrappers that embed them. */
+const TSD_SHAPE_STYLE = 3015;
+const TSD_MEDIA_STYLE = 3016;
+function isDrawableStyleType(type, app) {
+    if (type === TSD_SHAPE_STYLE || type === TSD_MEDIA_STYLE)
+        return true;
+    const name = typeName(type, app);
+    return name !== undefined && /(Shape|Media)StyleArchive$/.test(name);
+}
+/**
+ * The TSD property bag inside a (possibly wrapped) drawable style.
+ *
+ * `TSWP.ShapeStyleArchive` puts its own *text-frame* properties (columns,
+ * padding, vertical alignment) at field 11 and keeps the visual ones in
+ * `super`. Descending while the child still has a field-11 bag lands on
+ * the TSD properties in both the wrapped and unwrapped cases.
+ */
+function drawableStyleProperties(message) {
+    let node = message;
+    let props = message.getMessage(DRAWABLE_STYLE_PROPERTIES);
+    for (let depth = 0; depth < 4; depth++) {
+        const child = node.getMessage(1);
+        const childProps = child?.getMessage(DRAWABLE_STYLE_PROPERTIES);
+        if (!child || !childProps)
+            break;
+        node = child;
+        props = childProps;
+    }
+    return props;
+}
+const DRAWABLE_STYLE_PROPERTIES = 11;
+/**
+ * Field numbers differ between shape and media property bags — media has
+ * no fill, so everything after it shifts down by one.
+ */
+const SHAPE_STYLE_FIELDS = { FILL: 1, STROKE: 2, OPACITY: 3, SHADOW: 4, REFLECTION: 5 };
+const MEDIA_STYLE_FIELDS = { STROKE: 1, OPACITY: 2, SHADOW: 3, REFLECTION: 4 };
+/** A live view of one drawable's visual style. */
+export class DrawableStyleHandle {
+    store;
+    styleObject;
+    /** Set when the handle came from a drawable, enabling copy-on-write. */
+    ownedBy;
+    constructor(store, object, ownedBy) {
+        this.store = store;
+        this.styleObject = object;
+        if (ownedBy)
+            this.ownedBy = ownedBy;
+    }
+    get object() {
+        return this.styleObject;
+    }
+    get id() {
+        return this.styleObject.identifier;
+    }
+    /**
+     * True for images and movies, whose property bag omits `fill` and so
+     * numbers every later field one lower.
+     *
+     * Decided by declared type where known, and structurally otherwise:
+     * field 2 is a stroke message in a shape bag but the float opacity in a
+     * media bag, so its wire type settles the question for wrapper types the
+     * registry does not name.
+     */
+    get isMedia() {
+        if (this.object.type === TSD_MEDIA_STYLE)
+            return true;
+        if (this.object.type === TSD_SHAPE_STYLE)
+            return false;
+        const name = typeName(this.object.type, this.store.app);
+        if (name !== undefined && /MediaStyleArchive$/.test(name))
+            return true;
+        if (name !== undefined && /ShapeStyleArchive$/.test(name))
+            return false;
+        return this.properties()?.fieldWire(2) === WireType.Fixed32;
+    }
+    properties() {
+        return drawableStyleProperties(this.object.message);
+    }
+    fields() {
+        return this.isMedia ? MEDIA_STYLE_FIELDS : SHAPE_STYLE_FIELDS;
+    }
+    /** Everything this style sets, in one object. */
+    read() {
+        const props = this.properties();
+        const out = {};
+        if (!props)
+            return out;
+        const fields = this.fields();
+        if (fields.FILL !== undefined) {
+            const fill = readFill(props.getMessage(fields.FILL));
+            if (fill)
+                out.fill = fill;
+        }
+        const stroke = readStroke(props.getMessage(fields.STROKE));
+        if (stroke)
+            out.stroke = stroke;
+        const opacity = props.getFloat(fields.OPACITY);
+        if (opacity !== undefined)
+            out.opacity = opacity;
+        const shadow = readShadow(props.getMessage(fields.SHADOW));
+        if (shadow)
+            out.shadow = shadow;
+        const reflection = props.getMessage(fields.REFLECTION)?.getFloat(REFLECTION_OPACITY);
+        if (reflection !== undefined)
+            out.reflection = reflection;
+        return out;
+    }
+    shadow() {
+        return this.read().shadow ?? undefined;
+    }
+    /**
+     * Merge visual properties into this style.
+     *
+     * `null` removes a property outright; omitting it leaves whatever was
+     * there. Note that a shadow with `enabled: false` is how the apps store
+     * "shadow configured but switched off" — removing the archive and
+     * disabling it are different states, and both are expressible.
+     *
+     * Copies on write: a style archive is routinely shared — the theme
+     * lists one, templates hand one to every drawable using them, and a
+     * deep copy shares its source's — so writing through a shared archive
+     * would restyle every drawable holding it. When the handle knows its
+     * drawable and the archive has other referrers, the write goes to a
+     * private clone with the drawable's reference repointed, which is the
+     * app's own behaviour: styling one object never edits the shared
+     * style. A handle from {@link drawableStylesOf} has no owning
+     * drawable and edits the archive in place.
+     */
+    set(style) {
+        this.privatise();
+        let props = this.properties();
+        if (!props) {
+            props = RawMessage.create();
+            this.object.message.setMessage(DRAWABLE_STYLE_PROPERTIES, props);
+        }
+        const fields = this.fields();
+        if (style.fill !== undefined) {
+            if (fields.FILL === undefined) {
+                throw new RangeError(`style ${this.id} is a media style; images and movies have no fill`);
+            }
+            if (style.fill === null)
+                props.remove(fields.FILL);
+            else
+                props.setMessage(fields.FILL, writeFill(style.fill));
+        }
+        if (style.stroke !== undefined) {
+            if (style.stroke === null)
+                props.remove(fields.STROKE);
+            else
+                props.setMessage(fields.STROKE, writeStroke(style.stroke));
+        }
+        if (style.opacity !== undefined)
+            props.setFloat(fields.OPACITY, style.opacity);
+        if (style.shadow !== undefined) {
+            if (style.shadow === null)
+                props.remove(fields.SHADOW);
+            else {
+                // The app hangs a per-type sub-archive off the shadow when its
+                // type-specific knobs are touched — `contactShadow` (9) holding
+                // the corpus's one measured float, `curvedShadow` (10) holding
+                // the curvature an inspector edit writes. Rewriting the shadow
+                // carries an existing sub-archive forward when the type is
+                // unchanged, so re-parameterising an app-edited shadow keeps
+                // its curvature; a type change drops it, since a sub-archive
+                // for another type is a shape no corpus shadow has.
+                const previous = props.getMessage(fields.SHADOW);
+                const next = writeShadow(style.shadow);
+                if (previous) {
+                    const previousType = previous.getUint(ShadowFields.TYPE) ?? 0;
+                    const nextType = next.getUint(ShadowFields.TYPE) ?? 0;
+                    if (previousType === nextType) {
+                        for (const no of SHADOW_SUBARCHIVE_FIELDS) {
+                            const sub = previous.getMessage(no);
+                            if (sub)
+                                next.setMessage(no, sub);
+                        }
+                    }
+                }
+                props.setMessage(fields.SHADOW, next);
+            }
+        }
+        if (style.reflection !== undefined) {
+            if (style.reflection === null)
+                props.remove(fields.REFLECTION);
+            else {
+                const reflection = RawMessage.create();
+                reflection.setFloat(REFLECTION_OPACITY, style.reflection);
+                props.setMessage(fields.REFLECTION, reflection);
+            }
+        }
+        this.object.message.setVarint(DRAWABLE_STYLE_OVERRIDE_COUNT, props.fields.length);
+        return this;
+    }
+    /** Turn a shadow on or off without discarding its parameters. */
+    setShadowEnabled(enabled) {
+        const existing = this.read().shadow;
+        return this.set({ shadow: { ...(existing ?? DEFAULT_SHADOW), enabled } });
+    }
+    /**
+     * Give the owning drawable its own copy of a shared style archive.
+     *
+     * The clone takes the app's style-one-object shape whole: anonymous —
+     * no name, no `style_identifier`, since no two of the corpus's 18554
+     * identified styles share an identifier and a byte-copy keeping the
+     * source's would put two styles behind one — parented on the
+     * identified style it copies (30 of 183 drawable-referenced corpus
+     * styles are exactly that; the other 153 are the identified originals
+     * themselves), and listed in its stylesheet's `styles` list with the
+     * reference declared (183 of 183 are listed). The app's style
+     * machinery asserts over archives outside this shape when the
+     * inspector edits one, and the assert aborts the whole app.
+     */
+    privatise() {
+        if (!this.ownedBy)
+            return;
+        const { drawable, field } = this.ownedBy;
+        const others = this.store.referrers(this.id).filter((id) => id !== drawable.identifier);
+        if (others.length === 0)
+            return;
+        const source = this.styleObject;
+        const component = this.store.componentOf(source.identifier);
+        if (!component)
+            throw new RangeError(`drawable style ${this.id} has no component`);
+        const clone = this.store.createObject(source.type, component, { cloneFrom: source });
+        const sup = clone.message.getMessage(1);
+        if (sup) {
+            sup.remove(StyleIdentity.NAME);
+            sup.remove(StyleIdentity.STYLE_IDENTIFIER);
+            sup.setMessage(StyleIdentity.PARENT, makeRef(source.identifier));
+            const sheetId = refId(sup, StyleIdentity.STYLESHEET);
+            const sheet = sheetId !== undefined ? this.store.object(sheetId) : undefined;
+            if (sheet) {
+                sheet.message.addMessage(SheetFields.STYLES, makeRef(clone.identifier));
+                sheet.setObjectReferences([
+                    ...new Set([...sheet.getObjectReferences(), clone.identifier]),
+                ]);
+            }
+        }
+        drawable.message.setMessage(field, makeRef(clone.identifier));
+        this.store.retargetReference(drawable, this.id, clone.identifier);
+        this.styleObject = clone;
+    }
+}
+/** TSD.ReflectionArchive holds only its opacity. */
+const REFLECTION_OPACITY = 1;
+const DRAWABLE_STYLE_OVERRIDE_COUNT = 10;
+/**
+ * The style identity fields live on TSS.StyleArchive (`super` at field 1
+ * of every concrete style). Privatising needs them, and tsd sits below
+ * tss in the layer order, so they resolve here.
+ */
+const StyleIdentity = protoFields("TSS.StyleArchive", {
+    NAME: "name",
+    STYLE_IDENTIFIER: "style_identifier",
+    PARENT: "parent",
+    STYLESHEET: "stylesheet",
+});
+const SheetFields = protoFields("TSS.StylesheetArchive", { STYLES: "styles" });
+/** Every drawable in a document that carries a visual style. */
+export function drawableStylesOf(store) {
+    const out = [];
+    for (const { obj } of store.allObjects()) {
+        if (isDrawableStyleType(obj.type, store.app))
+            out.push(new DrawableStyleHandle(store, obj));
+    }
+    return out;
+}
+//# sourceMappingURL=drawables.js.map

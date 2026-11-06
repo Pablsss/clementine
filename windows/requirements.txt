@@ -1,0 +1,13 @@
+PySide6-Essentials==6.8.3
+pillow
+pillow-heif
+pypdf
+pypdfium2
+pdfplumber
+python-docx
+python-pptx
+openpyxl
+xlsxwriter
+winrt-runtime
+winrt-Windows.Storage
+winrt-Windows.ApplicationModel.DataTransfer

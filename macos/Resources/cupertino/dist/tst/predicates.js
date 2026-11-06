@@ -1,0 +1,329 @@
+/**
+ * Table predicates (`TST.FormulaPredicateArchive`).
+ *
+ * One structure answers "does this cell match?" for two features that look
+ * unrelated in the UI: **conditional formatting** ("colour this cell when
+ * it is below zero") and **filters** ("show rows where this column is
+ * below zero"). Apple stores both as the same archive, distinguished only
+ * by a `for_conditional_style` flag, so this module is shared rather than
+ * duplicated into {@link ../tst/conditional.ts} and {@link ../tst/filters.ts}.
+ *
+ * A predicate is stored twice over, redundantly:
+ *
+ *  - as a **formula** — a real TSCE AST, `<cell> < 0` — which is what the
+ *    calc engine evaluates; and
+ *  - as a **template**: `predicate_type` naming the comparison, plus up to
+ *    three `param_value` operands and the AST indexes they occupy, which
+ *    is what the UI's condition editor round-trips.
+ *
+ * The two must agree, and that redundancy is what makes this decodable
+ * without Apple's enum. `predicate_type` is an unpublished integer; the
+ * formula's terminal operator node is the documented TSCE comparison enum
+ * this library already renders. So the **formula is treated as
+ * authoritative** for what the condition means, and `predicate_type` is
+ * carried through as an opaque number. {@link PREDICATE_TYPE_OPERATORS}
+ * records only the pairings the corpus actually exhibits — it is a log of
+ * observations, not a guess at the full enum.
+ *
+ * The operand under test has no address: a predicate is written once and
+ * applied to a whole range, so Apple encodes it as a linked cell reference
+ * with no coordinate. It renders as {@link SELF_CELL_MARKER} unless the
+ * caller knows which cell they are asking about.
+ */
+import { protoFields } from "../proto/fields.js";
+import { decodeDecimal128 } from "./cellrecord.js";
+import { AstNodeArrayFields, AstNodeFields, AstNodeType, FormulaFields } from "../tsce/ast.js";
+import { renderFormula, SELF_CELL_MARKER, } from "./formulas.js";
+/** TST.FormulaPredicateArchive. */
+export const PredicateFields = protoFields("TST.FormulaPredicateArchive", {
+    PREDICATE_TYPE: "predicate_type",
+    QUALIFIER1: "qualifier1",
+    QUALIFIER2: "qualifier2",
+    PARAM_VALUE0: "param_value0",
+    PARAM_VALUE1: "param_value1",
+    PARAM_VALUE2: "param_value2",
+    FORMULA: "formula",
+    FOR_CONDITIONAL_STYLE: "for_conditional_style",
+    HOST_TABLE_UID: "host_table_uid",
+    HOST_COLUMN_UID: "host_column_uid",
+    HOST_ROW_UID: "host_row_uid",
+});
+/**
+ * TST.FormulaPredicatePrePivotArchive — the pre-2016 shape.
+ *
+ * Same idea, but the operands are *positions in the AST* rather than
+ * values: `param_index0/1/2` say which node each editable operand is.
+ * Files written by current apps carry both forms; older ones carry only
+ * this. A `param_index` of -1 means the slot is unused.
+ */
+export const PrePivotPredicateFields = protoFields("TST.FormulaPredicatePrePivotArchive", {
+    FORMULA: "formula",
+    PREDICATE_TYPE: "predicate_type",
+    QUALIFIER1: "qualifier1",
+    QUALIFIER2: "qualifier2",
+    PARAM_INDEX1: "param_index1",
+    PARAM_INDEX2: "param_index2",
+    PARAM_INDEX0: "param_index0",
+});
+/** TST.FormulaPredArgArchive. */
+export const PredArgFields = protoFields("TST.FormulaPredArgArchive", {
+    ARG_TYPE: "arg_type",
+    ARG_VALUE: "arg_value",
+    BASE_CELL_REF: "base_cell_ref",
+    RELATIVE_CELL_REF: "relative_cell_ref",
+    CATEGORY_REF: "category_ref",
+    UID_TRACT_LIST: "uid_tract_list",
+    HOST_CELL_COORD: "host_cell_coord",
+    PRESERVE_ROW: "preserve_row",
+    PRESERVE_COLUMN: "preserve_column",
+    LIST_ENTRIES: "list_entries",
+    VIEW_TRACT_REF: "view_tract_ref",
+});
+/** TST.FormulaPredArgDataArchive — one operand's value, by type. */
+export const PredArgDataFields = protoFields("TST.FormulaPredArgDataArchive", {
+    DOUBLE_VALUE: "double_value",
+    DECIMAL_LOW: "decimal_low",
+    DECIMAL_HIGH: "decimal_high",
+    STRING_VALUE: "string_value",
+    DATE_VALUE: "date_value",
+    DURATION_TIMEINTERVAL: "duration_timeinterval",
+    DURATION_UNITS: "duration_units",
+    BOOLEAN_VALUE: "boolean_value",
+});
+/**
+ * Comparison operators, by the TSCE AST node that encodes them.
+ *
+ * These are the documented enum, not an inference: the same node types
+ * appear in ordinary cell formulas, where their meaning is visible in the
+ * app's formula bar.
+ */
+const OPERATOR_BY_NODE = new Map([
+    [AstNodeType.EQUAL_TO, "="],
+    [AstNodeType.NOT_EQUAL_TO, "<>"],
+    [AstNodeType.GREATER_THAN, ">"],
+    [AstNodeType.GREATER_THAN_OR_EQUAL, ">="],
+    [AstNodeType.LESS_THAN, "<"],
+    [AstNodeType.LESS_THAN_OR_EQUAL, "<="],
+]);
+/**
+ * `predicate_type` values paired with the operator their formula uses.
+ *
+ * **Observations, not a schema.** Every entry is a pairing seen in the
+ * fixture corpus, where the formula AST independently states the
+ * comparison. Apple's enum certainly has more members; a value absent
+ * here is reported as `undefined` rather than guessed, because a filter
+ * silently read as "greater than" when it means "greater than or equal"
+ * is worse than one honestly reported as unknown.
+ *
+ * All six codes are observed, each stated by a real document's own
+ * formula, and they follow the condition menu's order laid out from 5.
+ * Filters and conditional formatting share the encoding — 7 is confirmed
+ * from both. `scripts/harvest-predicates.ts` re-derives every pairing
+ * from any rule-bearing file.
+ */
+export const PREDICATE_TYPE_OPERATORS = new Map([
+    [5, "="],
+    [6, "<>"],
+    [7, ">"],
+    [8, ">="],
+    [9, "<"],
+    [10, "<="],
+]);
+/**
+ * `predicate_type` values whose formula is a function call, not a
+ * comparison.
+ *
+ * Numbers' non-comparison conditions — "is blank", "text contains", and the
+ * rest — compile to a function rather than an operator, so they have no
+ * entry in {@link PREDICATE_TYPE_OPERATORS}. Recording the codes anyway
+ * means a reader can say *which* condition it is looking at, and it keeps
+ * them from being mistaken for gaps in the comparison enum.
+ *
+ * Type **3** is "text contains" in both rule systems: it compiles to
+ * `NOT(ISERROR(f(needle, cell)))`, where `f` is function index **296** —
+ * SEARCH-shaped in its arguments, but not SEARCH, which is 131. That index
+ * is in no harvested name table, so the formula renders it `FUNCTION_296`
+ * and this map records no entry for 3: an entry's value is the identifying
+ * callee's *name*, and 296 does not have one yet.
+ */
+export const PREDICATE_TYPE_FUNCTIONS = new Map([
+    [34, "ISBLANK"],
+    [54, "SUM"],
+]);
+/**
+ * The menu-order layout of the comparison enum: Numbers' condition menu
+ * lists the comparisons in a fixed order, and laying that order out from
+ * 5 gives every code. All six are observed, so this map now agrees with
+ * {@link PREDICATE_TYPE_OPERATORS} entry for entry; it stays because
+ * `scripts/harvest-predicates.ts` scores fresh observations against it,
+ * which keeps any future measurement decisive. It is **never consulted
+ * when reading**: {@link readPredicate} takes the operator from the
+ * formula, which states it outright.
+ */
+export const PREDICATE_TYPE_HYPOTHESIS = new Map([
+    [5, "="],
+    [6, "<>"],
+    [7, ">"],
+    [8, ">="],
+    [9, "<"],
+    [10, "<="],
+]);
+/** Which entries of the hypothesis the corpus has actually confirmed. */
+export function predicateTypeStatus() {
+    return [...PREDICATE_TYPE_HYPOTHESIS].map(([type, operator]) => ({
+        type,
+        operator,
+        proven: PREDICATE_TYPE_OPERATORS.get(type) === operator,
+    }));
+}
+/**
+ * True when a field is present *and* length-delimited.
+ *
+ * `has` alone is not enough: field 7 is the formula in the modern predicate
+ * archive, and a document in the wild puts a varint there. Reading wire
+ * type before reaching for a submessage is the schema-light rule this
+ * library is built on, and this is the spot that forgot it.
+ */
+function hasMessageAt(message, field) {
+    return message.fields.some((f) => f.no === field && f.wire === 2);
+}
+/**
+ * Decode a `TST.FormulaPredicateArchive`.
+ *
+ * Also accepts the pre-pivot shape, whose field numbers differ; the two
+ * are told apart by where the formula sits (field 7 in the modern archive,
+ * field 1 in the older one).
+ */
+export function readPredicate(message, options = {}) {
+    if (!message)
+        return undefined;
+    const prePivot = !hasMessageAt(message, PredicateFields.FORMULA) &&
+        hasMessageAt(message, PrePivotPredicateFields.FORMULA);
+    const fields = prePivot ? PrePivotPredicateFields : PredicateFields;
+    // Not `getMessage`: some archives put a scalar where the modern schema
+    // puts the formula, and a predicate with no readable formula is still a
+    // predicate worth reporting — with its type — rather than a crash.
+    const formulaMessage = hasMessageAt(message, fields.FORMULA)
+        ? message.getMessage(fields.FORMULA)
+        : undefined;
+    const origin = options.row !== undefined && options.column !== undefined
+        ? { row: options.row, column: options.column }
+        : undefined;
+    const formula = renderFormula(formulaMessage, origin, {
+        selfCell: options.selfCell ?? SELF_CELL_MARKER,
+        ...(options.owners ? { owners: options.owners } : {}),
+    });
+    const operator = terminalOperator(formulaMessage);
+    const predicateType = message.getUint(fields.PREDICATE_TYPE);
+    const expected = predicateType === undefined ? undefined : PREDICATE_TYPE_OPERATORS.get(predicateType);
+    const operands = [];
+    if (!prePivot) {
+        for (const field of [
+            PredicateFields.PARAM_VALUE0,
+            PredicateFields.PARAM_VALUE1,
+            PredicateFields.PARAM_VALUE2,
+        ]) {
+            const operand = readOperand(message.getMessage(field));
+            if (operand && operand.kind !== "none")
+                operands.push(operand);
+        }
+    }
+    return {
+        predicateType,
+        qualifier1: message.getUint(fields.QUALIFIER1),
+        qualifier2: message.getUint(fields.QUALIFIER2),
+        forConditionalStyle: message.getBool(PredicateFields.FOR_CONDITIONAL_STYLE) ?? false,
+        operator,
+        operands,
+        text: formula.text.replace(/^=/, ""),
+        formula,
+        inconsistent: expected !== undefined && operator !== undefined && expected !== operator,
+    };
+}
+/**
+ * The comparison a predicate formula performs.
+ *
+ * The AST is post-order, so the comparison — when the formula is a plain
+ * comparison at all — is its last node. A formula ending in anything else
+ * (a function call, for a "text contains" rule) has no simple operator,
+ * and saying so is more useful than picking the nearest comparison found
+ * somewhere inside it.
+ */
+function terminalOperator(formula) {
+    const nodes = formula
+        ?.getMessage(FormulaFields.AST_NODE_ARRAY)
+        ?.getMessages(AstNodeArrayFields.NODES);
+    const last = nodes?.[nodes.length - 1];
+    const type = last?.getUint(AstNodeFields.TYPE);
+    return type === undefined ? undefined : OPERATOR_BY_NODE.get(type);
+}
+/**
+ * Decode one `TST.FormulaPredArgArchive`.
+ *
+ * The kind comes from which field carries a value rather than from
+ * `arg_type`: the populated field is unambiguous, whereas `arg_type` is an
+ * unpublished enum whose members beyond those in the corpus are unknown.
+ */
+export function readOperand(message) {
+    if (!message)
+        return undefined;
+    const argType = message.getUint(PredArgFields.ARG_TYPE);
+    const base = { kind: "none", argType };
+    if (message.has(PredArgFields.RELATIVE_CELL_REF) || message.has(PredArgFields.BASE_CELL_REF)) {
+        return { ...base, kind: "cell" };
+    }
+    if (message.has(PredArgFields.UID_TRACT_LIST) || message.has(PredArgFields.VIEW_TRACT_REF)) {
+        return { ...base, kind: "range" };
+    }
+    const value = message.getMessage(PredArgFields.ARG_VALUE);
+    if (!value)
+        return base;
+    const string = value.getString(PredArgDataFields.STRING_VALUE);
+    if (string !== undefined)
+        return { ...base, kind: "string", string };
+    const boolean = value.getBool(PredArgDataFields.BOOLEAN_VALUE);
+    if (boolean !== undefined)
+        return { ...base, kind: "boolean", boolean };
+    if (value.has(PredArgDataFields.DATE_VALUE)) {
+        return { ...base, kind: "date", number: value.getDouble(PredArgDataFields.DATE_VALUE) ?? 0 };
+    }
+    if (value.has(PredArgDataFields.DURATION_TIMEINTERVAL)) {
+        const operand = {
+            ...base,
+            kind: "duration",
+            number: value.getDouble(PredArgDataFields.DURATION_TIMEINTERVAL) ?? 0,
+        };
+        const units = value.getUint(PredArgDataFields.DURATION_UNITS);
+        return units === undefined ? operand : { ...operand, durationUnits: units };
+    }
+    // Numbers carry both a double and a decimal128; the decimal is exact and
+    // the double is a convenience copy, so prefer the decimal when present.
+    if (value.has(PredArgDataFields.DECIMAL_HIGH) || value.has(PredArgDataFields.DECIMAL_LOW)) {
+        return { ...base, kind: "number", number: decimalOf(value) };
+    }
+    if (value.has(PredArgDataFields.DOUBLE_VALUE)) {
+        return { ...base, kind: "number", number: value.getDouble(PredArgDataFields.DOUBLE_VALUE) ?? 0 };
+    }
+    return base;
+}
+/** The 16-byte decimal128 split across two varint fields. */
+function decimalOf(value) {
+    const low = value.getVarint(PredArgDataFields.DECIMAL_LOW) ?? 0n;
+    const high = value.getVarint(PredArgDataFields.DECIMAL_HIGH) ?? 0n;
+    const bytes = new Uint8Array(16);
+    const view = new DataView(bytes.buffer);
+    view.setBigUint64(0, BigInt.asUintN(64, low), true);
+    view.setBigUint64(8, BigInt.asUintN(64, high), true);
+    return decodeDecimal128(bytes);
+}
+/**
+ * A predicate as a readable condition.
+ *
+ * `subject` replaces the "cell under test" marker, so a caller who knows
+ * they are asking about B4 gets `B4 < 0` rather than `THIS_CELL<0`.
+ */
+export function describePredicate(predicate, subject) {
+    const text = predicate.text || "(empty condition)";
+    return subject ? text.split(SELF_CELL_MARKER).join(subject) : text;
+}
+//# sourceMappingURL=predicates.js.map

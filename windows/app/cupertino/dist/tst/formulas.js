@@ -1,0 +1,445 @@
+import { decodeDecimal128 } from "./cellrecord.js";
+import { HARVESTED_FUNCTIONS, HARVEST_PROVENANCE } from "./function-names.js";
+import { BUILTIN_FUNCTIONS } from "./function-builtins.js";
+import { readCfUid } from "../tsce/owners.js";
+export { AstNodeArrayFields, AstNodeFields, AstNodeType, ColonTractFields, CoordinateFields, CROSS_TABLE_PREFIX, FormulaFields, } from "../tsce/ast.js";
+import { AstNodeArrayFields, AstNodeFields, AstNodeType, ColonTractFields, CoordinateFields, CROSS_TABLE_PREFIX, FormulaFields, } from "../tsce/ast.js";
+const TractRangeFields = { BEGIN: 1, END: 2 };
+/**
+ * Marker for a reference into a table this renderer could not name.
+ *
+ * The AST stores the target as a calc-engine **owner UUID**, not anything
+ * resembling a table. Pass a {@link RenderOptions.owners} registry and the
+ * reference renders as `Revenue::A2`; without one — or for the handful of
+ * owners a document does not resolve — it falls back to this marker,
+ * because rendering a bare `A2` would read as a cell in the formula's *own*
+ * table and be actively wrong.
+ *
+
+/**
+ * Stands in for a linked cell reference that carries no coordinate.
+ *
+ * Filter and conditional-style predicates are written once and applied to
+ * many cells, so the operand under test is not an address — it is
+ * "whichever cell this rule was attached to". Apple encodes that as a
+ * `LINKED_CELL_REFERENCE_NODE` with a table identity but no row or column.
+ * Rendering it as `A1` would name a cell the rule does not mean, so it
+ * renders as this marker unless the caller supplies the concrete address
+ * via {@link RenderOptions.selfCell}.
+ */
+export const SELF_CELL_MARKER = "THIS_CELL";
+/** Binary operators, with their symbol and binding power. */
+const BINARY_OPERATORS = new Map([
+    [AstNodeType.EQUAL_TO, { symbol: "=", precedence: 1 }],
+    [AstNodeType.NOT_EQUAL_TO, { symbol: "<>", precedence: 1 }],
+    [AstNodeType.GREATER_THAN, { symbol: ">", precedence: 1 }],
+    [AstNodeType.GREATER_THAN_OR_EQUAL, { symbol: ">=", precedence: 1 }],
+    [AstNodeType.LESS_THAN, { symbol: "<", precedence: 1 }],
+    [AstNodeType.LESS_THAN_OR_EQUAL, { symbol: "<=", precedence: 1 }],
+    [AstNodeType.CONCATENATION, { symbol: "&", precedence: 2 }],
+    [AstNodeType.ADDITION, { symbol: "+", precedence: 3 }],
+    [AstNodeType.SUBTRACTION, { symbol: "-", precedence: 3 }],
+    [AstNodeType.MULTIPLICATION, { symbol: "*", precedence: 4 }],
+    [AstNodeType.DIVISION, { symbol: "/", precedence: 4 }],
+    [AstNodeType.POWER, { symbol: "^", precedence: 5 }],
+]);
+const UNARY_PRECEDENCE = 6;
+const PRIMARY_PRECEDENCE = 10;
+const registeredFunctions = new Map();
+/**
+ * Resolution order, narrowest scope first: names registered at runtime,
+ * then a table harvested from a real Numbers install, then the entries the
+ * fixture corpus proves. A caller who has measured their own Numbers
+ * version always wins over anything shipped.
+ */
+function lookup(index) {
+    return registeredFunctions.get(index) ?? HARVESTED_FUNCTIONS.get(index) ?? BUILTIN_FUNCTIONS.get(index);
+}
+/** How the shipped function table was obtained, for diagnostics. */
+export function functionTableProvenance() {
+    return {
+        harvested: HARVESTED_FUNCTIONS.size,
+        builtin: BUILTIN_FUNCTIONS.size,
+        registered: registeredFunctions.size,
+        app: HARVEST_PROVENANCE.app,
+    };
+}
+/**
+ * Teach the renderer more function names.
+ *
+ * Mirrors `registerTypes()` for the archive registry: the library ships
+ * what it can prove and lets callers who have harvested more supply them,
+ * rather than baking in a table nobody can verify.
+ */
+export function registerFormulaFunctions(names) {
+    for (const [index, name] of Object.entries(names)) {
+        registeredFunctions.set(Number(index), name);
+    }
+}
+export function clearRegisteredFormulaFunctions() {
+    registeredFunctions.clear();
+}
+/** Name for a function index, or a visible placeholder when unknown. */
+export function functionName(index) {
+    return lookup(index) ?? `FUNCTION_${index}`;
+}
+/** True when the index has a real name rather than a placeholder. */
+export function isKnownFunction(index) {
+    return lookup(index) !== undefined;
+}
+/** Spreadsheet column letters: 0 → A, 25 → Z, 26 → AA. */
+export function columnName(column) {
+    let name = "";
+    let n = column + 1;
+    while (n > 0) {
+        const remainder = (n - 1) % 26;
+        name = String.fromCharCode(65 + remainder) + name;
+        n = (n - remainder - 1) / 26;
+    }
+    return name;
+}
+/** `A1`-style address; either half may be omitted for whole row/column refs. */
+export function cellAddress(column, row, absoluteColumn = false, absoluteRow = false) {
+    const columnPart = column === undefined ? "" : `${absoluteColumn ? "$" : ""}${columnName(column)}`;
+    const rowPart = row === undefined ? "" : `${absoluteRow ? "$" : ""}${row + 1}`;
+    return `${columnPart}${rowPart}`;
+}
+/**
+ * The table a cross-table node points at, when the caller can name it.
+ *
+ * Apple quotes a table name in a formula only when it needs to; a name with
+ * a space or a character that would parse as an operator is wrapped in
+ * single quotes, with embedded quotes doubled.
+ */
+function crossTableName(node, options) {
+    const info = node.getMessage(AstNodeFields.CROSS_TABLE_INFO);
+    const name = options.owners?.tableName(readCfUid(info?.getMessage(1)));
+    if (name === undefined)
+        return undefined;
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : `'${name.replace(/'/g, "''")}'`;
+}
+/**
+ * Render a `TSCE.FormulaArchive` as infix text.
+ *
+ * `origin` is the cell the formula lives in; relative references resolve
+ * against it. Omitting it renders relative references in their raw offset
+ * form (`R[-1]C[0]`), which is honest but rarely what a caller wants.
+ */
+export function renderFormula(formula, origin, options = {}) {
+    const unknownFunctions = [];
+    const unknownNodeTypes = [];
+    let hasCrossTableReferences = false;
+    const unnamedCrossTables = new Set();
+    const nodes = formula?.getMessage(FormulaFields.AST_NODE_ARRAY)?.getMessages(AstNodeArrayFields.NODES);
+    if (!nodes || nodes.length === 0) {
+        return {
+            text: "",
+            unknownFunctions,
+            unknownNodeTypes,
+            hasCrossTableReferences,
+            hasUnnamedCrossTables: false,
+        };
+    }
+    const stack = [];
+    const pop = (n) => {
+        // A truncated stack means the AST used a node whose arity we got wrong;
+        // padding keeps the render partial rather than throwing away the rest.
+        const taken = stack.splice(Math.max(0, stack.length - n), n);
+        while (taken.length < n)
+            taken.unshift({ text: "", precedence: PRIMARY_PRECEDENCE });
+        return taken;
+    };
+    const wrap = (operand, minimum) => operand.precedence < minimum ? `(${operand.text})` : operand.text;
+    for (const node of nodes) {
+        const type = node.getUint(AstNodeFields.TYPE);
+        if (type === undefined)
+            continue;
+        const binary = BINARY_OPERATORS.get(type);
+        if (binary) {
+            const [left, right] = pop(2);
+            // The right operand of a left-associative operator needs brackets at
+            // equal precedence too: a - (b - c) is not a - b - c.
+            stack.push({
+                text: `${wrap(left, binary.precedence)}${binary.symbol}${wrap(right, binary.precedence + 1)}`,
+                precedence: binary.precedence,
+            });
+            continue;
+        }
+        switch (type) {
+            case AstNodeType.NEGATION:
+            case AstNodeType.PLUS_SIGN: {
+                const [operand] = pop(1);
+                const sign = type === AstNodeType.NEGATION ? "-" : "+";
+                stack.push({
+                    text: `${sign}${wrap(operand, UNARY_PRECEDENCE)}`,
+                    precedence: UNARY_PRECEDENCE,
+                });
+                break;
+            }
+            case AstNodeType.PERCENT: {
+                const [operand] = pop(1);
+                stack.push({ text: `${wrap(operand, UNARY_PRECEDENCE)}%`, precedence: UNARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.FUNCTION: {
+                const index = node.getUint(AstNodeFields.FUNCTION_INDEX) ?? -1;
+                if (!isKnownFunction(index) && !unknownFunctions.includes(index)) {
+                    unknownFunctions.push(index);
+                }
+                const argCount = node.getUint(AstNodeFields.FUNCTION_NUM_ARGS) ?? 0;
+                const args = pop(argCount).map((a) => a.text);
+                stack.push({
+                    text: `${functionName(index)}(${args.join(",")})`,
+                    precedence: PRIMARY_PRECEDENCE,
+                });
+                break;
+            }
+            case AstNodeType.UNKNOWN_FUNCTION: {
+                const args = pop(node.getUint(AstNodeFields.FUNCTION_NUM_ARGS) ?? 0).map((a) => a.text);
+                const name = node.getString(AstNodeFields.STRING) ?? "UNKNOWN";
+                stack.push({ text: `${name}(${args.join(",")})`, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.NUMBER:
+                stack.push({ text: formatNumber(node), precedence: PRIMARY_PRECEDENCE });
+                break;
+            case AstNodeType.BOOLEAN:
+                stack.push({
+                    text: node.getBool(AstNodeFields.BOOLEAN) ? "TRUE" : "FALSE",
+                    precedence: PRIMARY_PRECEDENCE,
+                });
+                break;
+            case AstNodeType.TOKEN:
+                // An *omitted* argument, not a boolean. `AST_token_node_boolean` is
+                // set on these, which makes them look like TRUE — and rendering
+                // them that way produces a formula that evaluates to something
+                // else. The corpus settles it: `DURATION(<token>,<token>,8,22,11,500)`
+                // adds exactly 8h22m11.5s to its base date, so the two leading
+                // tokens contribute nothing. Weeks and days were simply left out.
+                stack.push({ text: "", precedence: PRIMARY_PRECEDENCE });
+                break;
+            case AstNodeType.STRING:
+                // Spreadsheet string literals escape a quote by doubling it.
+                stack.push({
+                    text: `"${(node.getString(AstNodeFields.STRING) ?? "").replace(/"/g, '""')}"`,
+                    precedence: PRIMARY_PRECEDENCE,
+                });
+                break;
+            case AstNodeType.EMPTY_ARGUMENT:
+                stack.push({ text: "", precedence: PRIMARY_PRECEDENCE });
+                break;
+            case AstNodeType.LIST:
+            case AstNodeType.ARRAY: {
+                const count = node.getUint(AstNodeFields.FUNCTION_NUM_ARGS) ?? 0;
+                const items = pop(count).map((a) => a.text);
+                const open = type === AstNodeType.ARRAY ? "{" : "(";
+                const close = type === AstNodeType.ARRAY ? "}" : ")";
+                stack.push({ text: `${open}${items.join(",")}${close}`, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.CELL_REFERENCE:
+            case AstNodeType.LOCAL_CELL_REFERENCE:
+            case AstNodeType.CROSS_TABLE_CELL_REFERENCE: {
+                const crossTable = node.has(AstNodeFields.CROSS_TABLE_INFO);
+                if (crossTable)
+                    hasCrossTableReferences = true;
+                const address = renderCellReference(node, origin);
+                let text = address;
+                if (crossTable && address !== "#REF!") {
+                    const name = crossTableName(node, options);
+                    if (name !== undefined)
+                        unnamedCrossTables.delete(name);
+                    text = `${name ?? CROSS_TABLE_PREFIX.slice(0, -2)}::${address}`;
+                    if (name === undefined)
+                        unnamedCrossTables.add(CROSS_TABLE_PREFIX);
+                }
+                stack.push({ text, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.LINKED_CELL_REFERENCE:
+            case AstNodeType.LINKED_COLUMN_REFERENCE:
+            case AstNodeType.LINKED_ROW_REFERENCE: {
+                // A linked reference tracks its target by identity rather than
+                // position, so it may carry no coordinate at all. When it does
+                // carry one it reads exactly like an ordinary reference.
+                const positioned = node.has(AstNodeFields.COLUMN) || node.has(AstNodeFields.ROW);
+                if (node.has(AstNodeFields.CROSS_TABLE_INFO) && positioned) {
+                    hasCrossTableReferences = true;
+                }
+                const text = positioned
+                    ? renderCellReference(node, origin)
+                    : (options.selfCell ?? SELF_CELL_MARKER);
+                stack.push({ text, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.COLON:
+            case AstNodeType.COLON_WITH_UIDS: {
+                const [from, to] = pop(2);
+                stack.push({ text: `${from.text}:${to.text}`, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.COLON_TRACT:
+                stack.push({ text: renderColonTract(node, origin), precedence: PRIMARY_PRECEDENCE });
+                break;
+            case AstNodeType.INTERSECTION: {
+                const [left, right] = pop(2);
+                stack.push({ text: `${left.text} ${right.text}`, precedence: PRIMARY_PRECEDENCE });
+                break;
+            }
+            case AstNodeType.REFERENCE_ERROR:
+            case AstNodeType.REFERENCE_ERROR_WITH_UIDS:
+                stack.push({ text: "#REF!", precedence: PRIMARY_PRECEDENCE });
+                break;
+            case AstNodeType.APPEND_WHITESPACE:
+            case AstNodeType.PREPEND_WHITESPACE: {
+                // Cosmetic: the author's spacing, preserved so a round-tripped
+                // render matches what they typed.
+                const [operand] = pop(1);
+                const space = node.getString(AstNodeFields.WHITESPACE) ?? "";
+                stack.push({
+                    text: type === AstNodeType.APPEND_WHITESPACE
+                        ? `${operand.text}${space}`
+                        : `${space}${operand.text}`,
+                    precedence: operand.precedence,
+                });
+                break;
+            }
+            case AstNodeType.DATE:
+            case AstNodeType.DURATION:
+                stack.push({ text: formatNumber(node), precedence: PRIMARY_PRECEDENCE });
+                break;
+            default:
+                if (!unknownNodeTypes.includes(type))
+                    unknownNodeTypes.push(type);
+                stack.push({ text: `NODE_${type}`, precedence: PRIMARY_PRECEDENCE });
+                break;
+        }
+    }
+    // A well-formed AST leaves exactly one operand; joining any extras keeps
+    // a partial result visible instead of silently dropping it.
+    const text = stack.map((operand) => operand.text).join(" ");
+    return {
+        text: text ? `=${text}` : "",
+        unknownFunctions,
+        unknownNodeTypes,
+        hasCrossTableReferences,
+        hasUnnamedCrossTables: unnamedCrossTables.size > 0,
+    };
+}
+/**
+ * A cell reference, resolved against the cell using the formula.
+ *
+ * `sint32` coordinates are zigzag-encoded offsets when `absolute` is
+ * false. Without an origin they render in R1C1 offset form rather than
+ * pretending to be absolute addresses.
+ */
+function renderCellReference(node, origin) {
+    const columnNode = node.getMessage(AstNodeFields.COLUMN);
+    const rowNode = node.getMessage(AstNodeFields.ROW);
+    const column = coordinate(columnNode);
+    const row = coordinate(rowNode);
+    if (!origin) {
+        const parts = [];
+        if (row)
+            parts.push(row.absolute ? `R${row.value + 1}` : `R[${row.value}]`);
+        if (column)
+            parts.push(column.absolute ? `C${column.value + 1}` : `C[${column.value}]`);
+        return parts.join("") || "#REF!";
+    }
+    const columnIndex = column
+        ? column.absolute
+            ? column.value
+            : origin.column + column.value
+        : undefined;
+    const rowIndex = row ? (row.absolute ? row.value : origin.row + row.value) : undefined;
+    if ((columnIndex !== undefined && columnIndex < 0) || (rowIndex !== undefined && rowIndex < 0)) {
+        return "#REF!";
+    }
+    return cellAddress(columnIndex, rowIndex, column?.absolute ?? false, row?.absolute ?? false);
+}
+function coordinate(node) {
+    if (!node)
+        return undefined;
+    const raw = node.getVarint(CoordinateFields.INDEX);
+    if (raw === undefined)
+        return undefined;
+    // proto2 sint32: zigzag.
+    const value = Number((raw >> 1n) ^ -(raw & 1n));
+    return { value, absolute: node.getBool(CoordinateFields.ABSOLUTE) ?? false };
+}
+/**
+ * A colon tract renders as the rectangle it describes.
+ *
+ * Absolute ranges are indexes; relative ones are offsets from the using
+ * cell, so they need the origin exactly as a relative cell reference does.
+ */
+function renderColonTract(node, origin) {
+    const tract = node.getMessage(AstNodeFields.COLON_TRACT);
+    if (!tract)
+        return "#REF!";
+    const absoluteColumns = tractRange(tract, ColonTractFields.ABSOLUTE_COLUMN);
+    const absoluteRows = tractRange(tract, ColonTractFields.ABSOLUTE_ROW);
+    const relativeColumns = tractRange(tract, ColonTractFields.RELATIVE_COLUMN);
+    const relativeRows = tractRange(tract, ColonTractFields.RELATIVE_ROW);
+    const columns = resolveTract(absoluteColumns, relativeColumns, origin?.column);
+    const rows = resolveTract(absoluteRows, relativeRows, origin?.row);
+    if (!columns && !rows)
+        return "#REF!";
+    if (columns === "unresolved" || rows === "unresolved")
+        return "#REF!";
+    const from = cellAddress(columns?.begin, rows?.begin, columns?.absolute, rows?.absolute);
+    const to = cellAddress(columns?.end, rows?.end, columns?.absolute, rows?.absolute);
+    return from === to ? from : `${from}:${to}`;
+}
+function resolveTract(absolute, relative, anchor) {
+    if (absolute)
+        return { ...absolute, absolute: true };
+    if (!relative)
+        return undefined;
+    if (anchor === undefined)
+        return "unresolved";
+    const begin = anchor + relative.begin;
+    const end = anchor + relative.end;
+    if (begin < 0 || end < 0)
+        return "unresolved";
+    return { begin, end, absolute: false };
+}
+/**
+ * One range from a tract. Relative bounds are `int32`, so a negative
+ * offset arrives as a full-width varint rather than zigzag.
+ */
+function tractRange(tract, field) {
+    const range = tract?.getMessages(field)[0];
+    if (!range)
+        return undefined;
+    const begin = int32(range.getVarint(TractRangeFields.BEGIN));
+    if (begin === undefined)
+        return undefined;
+    return { begin, end: int32(range.getVarint(TractRangeFields.END)) ?? begin };
+}
+function int32(raw) {
+    return raw === undefined ? undefined : Number(BigInt.asIntN(32, raw));
+}
+/**
+ * A numeric literal.
+ *
+ * Apple writes both a double and a decimal128 for the same value; the
+ * decimal is authoritative, for the same reason cells store decimals — it
+ * is what stops 0.1 from rendering as 0.1000000000000000055.
+ */
+function formatNumber(node) {
+    const low = node.getVarint(AstNodeFields.NUMBER_DECIMAL_LOW);
+    const high = node.getVarint(AstNodeFields.NUMBER_DECIMAL_HIGH);
+    if (low !== undefined && high !== undefined) {
+        const bytes = new Uint8Array(16);
+        const view = new DataView(bytes.buffer);
+        view.setBigUint64(0, BigInt.asUintN(64, low), true);
+        view.setBigUint64(8, BigInt.asUintN(64, high), true);
+        const value = decodeDecimal128(bytes);
+        if (Number.isFinite(value))
+            return String(value);
+    }
+    const double = node.getDouble(AstNodeFields.NUMBER);
+    return double === undefined ? "0" : String(double);
+}
+//# sourceMappingURL=formulas.js.map

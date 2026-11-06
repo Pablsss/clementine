@@ -1,0 +1,113 @@
+{
+  "name": "cupertino-files",
+  "version": "0.4.0",
+  "description": "Read, inspect, and edit Apple Pages, Numbers and Keynote documents (iWork / Creator Studio, modern IWA format) in pure TypeScript with zero runtime dependencies.",
+  "keywords": [
+    "iwork",
+    "pages",
+    "numbers",
+    "keynote",
+    "apple",
+    "iwa",
+    "snappy",
+    "protobuf",
+    "document",
+    "parser",
+    "key",
+    "creator-studio",
+    "cupertino"
+  ],
+  "license": "MIT",
+  "author": "Ole Kristensen <ole@kristensen.name>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/den-frie-vilje/cupertino-files.git"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "cupertino-files": "dist/main.js",
+    "cupertino-dump": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "proto",
+    "skills",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md",
+    "LICENSES"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "coverage": "node scripts/coverage-matrix.ts",
+    "coverage:check": "node scripts/coverage-matrix.ts --check",
+    "harvest": "node scripts/harvest-functions.ts",
+    "harvest:check": "node scripts/harvest-functions.ts --check",
+    "harvest:predicates": "node scripts/harvest-predicates.ts",
+    "prebnc": "node scripts/analyse-prebnc.ts",
+    "stress": "node scripts/stress-readers.ts",
+    "proto:check": "node scripts/check-proto-drift.ts --check",
+    "required:check": "node scripts/check-required-fields.ts",
+    "survey:fieldinfos": "node scripts/survey-field-infos.ts",
+    "probe": "node scripts/probe-unknowns.ts",
+    "verify:doc": "node scripts/make-verification-doc.ts",
+    "bisect:docs": "node scripts/make-bisect-docs.ts",
+    "privacy:check": "node scripts/scan-fixture-privacy.ts",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.e2e.test.ts",
+    "blanks": "node scripts/make-blanks.ts",
+    "blanks:check": "node scripts/make-blanks.ts --check",
+    "test:all": "npm run test && npm run test:e2e",
+    "pages:docs": "node scripts/make-pages-docs.ts",
+    "proto:embed": "node scripts/embed-proto-schema.ts",
+    "proto:embed:check": "node scripts/embed-proto-schema.ts --check",
+    "shape:audit": "node scripts/audit-authored-shape.ts",
+    "shape:check": "node scripts/audit-authored-shape.ts --check",
+    "lint": "eslint src test scripts",
+    "conformance": "node scripts/make-conformance.ts",
+    "conformance:check": "node scripts/make-conformance.ts --check",
+    "bundle:format": "node scripts/make-release-bundle.ts",
+    "keynote:docs": "node scripts/make-keynote-docs.ts",
+    "prepublishOnly": "npm run build && npm run lint && npm test",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "npm run api:docs && vitepress build docs",
+    "docs:preview": "vitepress preview docs",
+    "prepare": "npm run build",
+    "api:docs": "typedoc --plugin typedoc-plugin-markdown --plugin typedoc-vitepress-theme --out docs/api",
+    "tooldocs": "node scripts/generate-tool-docs.ts",
+    "tooldocs:check": "node scripts/generate-tool-docs.ts --check",
+    "audit:check": "npm audit --omit=dev && npm audit --audit-level=high",
+    "seeds": "node scripts/make-seeds.ts",
+    "demos": "node scripts/make-demos.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
+    "eslint": "^10.8.0",
+    "protobufjs": "^8.7.1",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-markdown": "^4.12.0",
+    "typedoc-vitepress-theme": "^1.1.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "vitepress": "^1.6.4"
+  },
+  "homepage": "https://den-frie-vilje.github.io/cupertino-files/",
+  "overrides": {
+    "vite": "^7.0.0"
+  }
+}
